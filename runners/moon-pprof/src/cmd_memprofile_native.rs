@@ -26,10 +26,12 @@
 //! ## End-to-end flow
 //!
 //! 1. From the `.exe` path, walk up to the MoonBit project root
-//!    (the directory containing `moon.mod.json`).
-//! 2. Run `moon build --target native --release` to ensure the
-//!    generated `.c` and the original `.exe` are up to date.
-//! 3. Run `moon build --target native --release --dry-run` and grep
+//!    (the directory containing `moon.mod` or `moon.mod.json`).
+//! 2. Run `moon build --target native --release <package>` to ensure
+//!    the generated `.c` and the original `.exe` are up to date.
+//!    If the package path cannot be inferred from the `.exe`, fall
+//!    back to building the project root.
+//! 3. Run `moon build --target native --release <package> --dry-run` and grep
 //!    for the `cc … -o …/<name>.exe` line for our target.
 //! 4. Read the generated `.c`, replace the body of
 //!    `moonbit_malloc_inlined` with one that calls
@@ -133,23 +135,37 @@ pub fn run(args: Args) -> Result<()> {
         project.display(),
         cmd_name,
     );
+    let build_path = infer_package_path_for_exe(&project, &original_exe);
 
     // Step 1: make sure the build is current. Cheap if already built.
-    let status = Command::new("moon")
+    let mut build_cmd = Command::new("moon");
+    build_cmd
         .current_dir(&project)
-        .args(["build", "--target", "native", "--release"])
+        .args(["build", "--target", "native", "--release"]);
+    if let Some(path) = &build_path {
+        build_cmd.arg(path);
+    }
+    let status = build_cmd
         .status()
-        .context("running `moon build --target native --release`")?;
+        .with_context(|| format!("running `{}`", moon_build_label(build_path.as_deref())))?;
     if !status.success() {
         bail!("`moon build` failed");
     }
 
     // Step 2: capture cc commands.
-    let dry_run = Command::new("moon")
+    let mut dry_cmd = Command::new("moon");
+    dry_cmd
         .current_dir(&project)
-        .args(["build", "--target", "native", "--release", "--dry-run"])
-        .output()
-        .context("running `moon build … --dry-run`")?;
+        .args(["build", "--target", "native", "--release", "--dry-run"]);
+    if let Some(path) = &build_path {
+        dry_cmd.arg(path);
+    }
+    let dry_run = dry_cmd.output().with_context(|| {
+        format!(
+            "running `{} --dry-run`",
+            moon_build_label(build_path.as_deref())
+        )
+    })?;
     if !dry_run.status.success() {
         bail!(
             "`moon build --dry-run` failed: {}",
@@ -338,12 +354,12 @@ pub fn run(args: Args) -> Result<()> {
 fn find_project_root(exe: &Path) -> Result<PathBuf> {
     let mut p = exe.to_path_buf();
     while p.pop() {
-        if p.join("moon.mod.json").exists() {
+        if p.join("moon.mod").exists() || p.join("moon.mod.json").exists() {
             return Ok(p);
         }
     }
     Err(anyhow!(
-        "could not find moon.mod.json walking up from {}",
+        "could not find moon.mod or moon.mod.json walking up from {}",
         exe.display()
     ))
 }
@@ -358,6 +374,78 @@ fn derive_cmd_name(exe: &Path) -> Result<String> {
 
 fn dirs_home() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
+}
+
+fn infer_package_path_for_exe(project: &Path, exe: &Path) -> Option<PathBuf> {
+    let rel = exe.strip_prefix(project).ok()?;
+    let components = rel.components().collect::<Vec<_>>();
+    let file_component_count = 1;
+    let build_idx = components.iter().rposition(|c| c.as_os_str() == "build")?;
+    if build_idx + 1 + file_component_count > components.len() {
+        return None;
+    }
+    let mut pkg_rel = PathBuf::new();
+    for component in &components[build_idx + 1..components.len() - file_component_count] {
+        pkg_rel.push(component.as_os_str());
+    }
+
+    for source_root in source_roots(project) {
+        let candidate = source_root.join(&pkg_rel);
+        if candidate.join("moon.pkg").exists() || candidate.join("moon.pkg.json").exists() {
+            return candidate.strip_prefix(project).ok().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+fn source_roots(project: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![project.to_path_buf()];
+    if let Some(source) = moon_mod_source(project) {
+        roots.push(project.join(source));
+    }
+    roots
+}
+
+fn moon_mod_source(project: &Path) -> Option<String> {
+    let mod_dsl = project.join("moon.mod");
+    if mod_dsl.exists() {
+        let text = fs::read_to_string(mod_dsl).ok()?;
+        return parse_dsl_source_field(&text);
+    }
+    let mod_json = project.join("moon.mod.json");
+    if mod_json.exists() {
+        let text = fs::read_to_string(mod_json).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        return json.get("source")?.as_str().map(str::to_string);
+    }
+    None
+}
+
+fn parse_dsl_source_field(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("source") {
+            let rest = rest.trim_start();
+            let rest = match rest.strip_prefix('=') {
+                Some(rest) => rest.trim_start(),
+                None => rest.strip_prefix(':')?.trim_start(),
+            };
+            let rest = rest.strip_prefix('"')?;
+            let end = rest.find('"')?;
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
+}
+
+fn moon_build_label(path: Option<&Path>) -> String {
+    match path {
+        Some(path) => format!(
+            "moon build --target native --release {}",
+            path.to_string_lossy()
+        ),
+        None => "moon build --target native --release".to_string(),
+    }
 }
 
 fn find_cc_line_for_exe(dry_text: &str, exe_filename: &str) -> Option<String> {
@@ -999,6 +1087,61 @@ mod tests {
     use std::io::Read as _;
 
     #[test]
+    fn project_root_accepts_new_moon_mod_format() {
+        let root = unique_temp_dir("moon-pprof-moon-mod-root");
+        let exe_dir = root.join("_build/native/release/build/cmd/demo");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(root.join("moon.mod"), "name = \"demo\"\n").unwrap();
+        let exe = exe_dir.join("demo.exe");
+        fs::write(&exe, "").unwrap();
+
+        let found = find_project_root(&exe).unwrap();
+        assert_eq!(found, root);
+
+        fs::remove_dir_all(found).ok();
+    }
+
+    #[test]
+    fn package_path_inference_uses_moon_mod_source_root() {
+        let root = unique_temp_dir("moon-pprof-source-root");
+        let pkg = root.join("src/cmd/bench");
+        let exe_dir = root.join("_build/native/release/build/cmd/bench");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(
+            root.join("moon.mod"),
+            "name = \"demo\"\noptions(\n  source: \"src\",\n)\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("moon.pkg"), "").unwrap();
+        let exe = exe_dir.join("bench.exe");
+        fs::write(&exe, "").unwrap();
+
+        let found = infer_package_path_for_exe(&root, &exe).unwrap();
+        assert_eq!(found, PathBuf::from("src/cmd/bench"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn package_path_inference_supports_default_root_layout() {
+        let root = unique_temp_dir("moon-pprof-default-root");
+        let pkg = root.join("cmd/bench");
+        let exe_dir = root.join("_build/native/release/build/cmd/bench");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(root.join("moon.mod.json"), "{\"name\":\"demo\"}\n").unwrap();
+        fs::write(pkg.join("moon.pkg"), "").unwrap();
+        let exe = exe_dir.join("bench.exe");
+        fs::write(&exe, "").unwrap();
+
+        let found = infer_package_path_for_exe(&root, &exe).unwrap();
+        assert_eq!(found, PathBuf::from("cmd/bench"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn retained_patch_tracks_alloc_pointer_and_free_macro() {
         let src = r#"
 #define moonbit_free(obj) libc_free(Moonbit_object_header(obj))
@@ -1091,5 +1234,13 @@ static void *moonbit_malloc_inlined(size_t size) {
             .get(idx as usize)
             .map(String::as_str)
             .unwrap_or("")
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let mut dir = env::temp_dir();
+        dir.push(format!("{prefix}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

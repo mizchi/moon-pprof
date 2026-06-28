@@ -347,7 +347,7 @@ from libsystem startup).
 generated C** and recompiling:
 
 1. From the `.exe` path, find the moon project root (containing
-   `moon.mod.json`) and grab the cc command that built it via
+   `moon.mod` or `moon.mod.json`) and grab the cc command that built it via
    `moon build --target native --release --dry-run`.
 2. Rewrite `moonbit_malloc_inlined`'s body in `<cmd>.c` to call
    `__moon_pprof_alloc_hook(size)` before the real `libc_malloc`.
