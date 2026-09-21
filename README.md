@@ -328,7 +328,7 @@ npm run build:native
   --out native-mem.pb.gz --sample-rate 100
 go tool pprof -alloc_space -http :8000 native-mem.pb.gz
 
-# retained heap at process exit (exact with --sample-rate 1)
+# retained records at exit (see coverage limitations below)
 .bin/moon-pprof memprofile-native \
   bench/_build/native/release/build/cmd/json_parse/json_parse.exe \
   --retained --out native-retained.pb.gz --sample-rate 1
@@ -349,11 +349,12 @@ generated C** and recompiling:
 1. From the `.exe` path, find the moon project root (containing
    `moon.mod` or `moon.mod.json`) and grab the cc command that built it via
    `moon build --target native --release --dry-run`.
-2. Rewrite `moonbit_malloc_inlined`'s body in `<cmd>.c` to call
-   `__moon_pprof_alloc_hook(size)` before the real `libc_malloc`.
-   With `--retained`, call `__moon_pprof_alloc_ptr_hook(ptr, size)`
-   after allocation and patch `moonbit_free(obj)` to call
-   `__moon_pprof_free_hook(obj)` before `libc_free`.
+2. Wrap `moonbit_malloc_inlined` in `<cmd>.c` to call
+   `__moon_pprof_alloc_hook(size)` while preserving the original allocator body,
+   including reference-count initialization, allocator selection, and GC safe points.
+   With `--retained`, call `__moon_pprof_alloc_ptr_hook(ptr, size)` after allocation
+   and wrap the existing `moonbit_free` macro (including header-defined macros)
+   to observe frees without changing its behavior or evaluating arguments twice.
 3. Compile a bundled `native_alloc_hook.c` (uses `backtrace(3)` +
    `dladdr(3)`) with the same cc flags.
 4. Re-run the original cc command with the patched `.c` + hook `.o`,
@@ -365,9 +366,14 @@ generated C** and recompiling:
    `inuse_objects/count` + `inuse_space/bytes`. `drop_frames` hides
    the hook, mimalloc, and runtime helpers so user code is the leaf.
 
-Same `--sample-rate <N>` semantics as the wasm path. Retained heap is
-exact at `--sample-rate 1`; larger rates track only sampled allocations
-and scale the live bytes/counts. On the
+Same `--sample-rate <N>` semantics as the wasm path. At rate 1 every allocation
+through the instrumented generated-C helper is recorded. This is **not total
+process allocation**: object headers, allocator overhead, and runtime-internal
+allocations (including some arrays/strings) are excluded. Retained profiles also
+miss frees performed inside the linked runtime, so remaining records can
+overcount live objects even at rate 1. Do not interpret them as proof of a leak;
+compare with RSS and object-lifetime evidence. Larger rates additionally sample
+and scale the captured bytes/counts. On the
 JSON parse workload, `--sample-rate 1` takes ~41 s and
 `--sample-rate 100` takes ~580 ms (~70× faster) with matching
 top-site attribution.

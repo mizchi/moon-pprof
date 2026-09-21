@@ -437,7 +437,9 @@ notes/                                  調査ログ + upstream 向け PR 素材
   `<cmd>.c` の `moonbit_malloc_inlined` を patch し、 backtrace 取得 hook を
   link して再 cc → 走らせる。`--retained` を付けると `moonbit_free` も patch
   して process exit 時点の `inuse_objects` / `inuse_space` を出す
-  (sample-rate=1 で exact、>1 は sampled estimate)。これは `mimalloc` が
+  （生成 C 内のフックを通る操作のみ。ランタイム内の割り当て・解放は捕捉しないため、
+  sample-rate=1 でもプロセス全体の正確なヒープ量ではなく、保持量を過大評価しうる）。
+  元のアロケータ・参照カウント初期化・GC 処理を保持してフックを挿入する。これは `mimalloc` が
   静的リンクされてて `DYLD_INSERT_LIBRARIES` では捕まえられない問題への対処。
   sample-rate=100 で ~70 倍速。macOS + Linux glibc 対応。
 - **demangle はヒューリスティック**。impl / method / generic 修飾子

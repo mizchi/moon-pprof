@@ -34,8 +34,8 @@
 //! 3. Run `moon build --target native --release <package> --dry-run` and grep
 //!    for the `cc … -o …/<name>.exe` line for our target.
 //! 4. Read the generated `.c`, replace the body of
-//!    `moonbit_malloc_inlined` with one that calls
-//!    `__moon_pprof_alloc_hook` (or the pointer hook for `--retained`),
+//!    `moonbit_malloc_inlined` with a wrapper around the original allocator
+//!    that calls `__moon_pprof_alloc_hook` (or the retained pointer hook),
 //!    write it to a sibling `<name>.memprof.c`.
 //! 5. Compile our bundled `native_alloc_hook.c` with the same `cc` to
 //!    a sibling `.memprof_hook.o`.
@@ -84,8 +84,8 @@ pub struct Args {
     /// `--sample-rate` flag on the wasm `memprofile` subcommand.
     #[arg(long, default_value_t = 1)]
     pub sample_rate: u32,
-    /// Emit a retained-heap profile (`inuse_objects` / `inuse_space`) by
-    /// tracking sampled allocation pointers until `moonbit_free`.
+    /// Track instrumented allocations until a generated-code `moonbit_free`.
+    /// Runtime-internal frees are not captured, so this can overcount live heap.
     #[arg(long)]
     pub retained: bool,
     /// Pass raw mangled symbols through instead of running them through
@@ -117,6 +117,17 @@ pub fn run(args: Args) -> Result<()> {
     } else {
         HeapProfileMode::Alloc
     };
+
+    eprintln!(
+        "[moon-pprof memprofile-native] coverage: generated-C object allocations only; \
+         runtime-internal allocations and object headers are excluded"
+    );
+    if args.retained {
+        eprintln!(
+            "[moon-pprof memprofile-native] retained coverage: runtime-internal frees \
+             are not captured; remaining records are not proof of a memory leak"
+        );
+    }
 
     let project = find_project_root(&original_exe)?;
     let cmd_name = derive_cmd_name(&original_exe)?;
@@ -644,77 +655,35 @@ impl HeapProfileMode {
 }
 
 fn patch_moonbit_malloc(src: &str, mode: HeapProfileMode) -> Result<String> {
-    // We need to inject a call to `__moon_pprof_alloc_hook(size)`
-    // *before* the libc_malloc call inside `moonbit_malloc_inlined`.
-    // Approach: insert a forward declaration up top, then rewrite the
-    // function body. The runtime's body is short and stable across
-    // versions:
-    //
-    //   static void *moonbit_malloc_inlined(size_t size) {
-    //     struct moonbit_object *ptr = (struct moonbit_object *)libc_malloc(
-    //         sizeof(struct moonbit_object) + size);
-    //     ptr->rc = 1;
-    //     return ptr + 1;
-    //   }
-    //
-    // We replace the whole function in one shot so we don't have to
-    // track moonbit's exact whitespace.
-
+    // Wrap the original allocator rather than synthesizing its body. Runtime
+    // versions differ in RC encoding, allocator selection, and GC safe points.
     let signature = "static void *moonbit_malloc_inlined(size_t size) {";
-    let start = src.find(signature).ok_or_else(|| {
-        anyhow!("could not find `moonbit_malloc_inlined` definition in generated C")
-    })?;
-    // Walk forward to find the matching close brace at depth 0.
-    let body_start = start + signature.len();
-    let mut depth = 1; // we're already inside the `{`
-    let mut end = body_start;
-    for (i, ch) in src[body_start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = body_start + i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
+    if !src.contains(signature) {
+        bail!("could not find `moonbit_malloc_inlined` definition in generated C");
     }
-    if depth != 0 {
-        bail!("unbalanced braces while scanning moonbit_malloc_inlined");
-    }
-
-    let replacement = match mode {
+    let wrapper = match mode {
         HeapProfileMode::Alloc => format!(
-            "static void *moonbit_malloc_inlined(size_t size) {{\n  \
-            extern void {HOOK_SYMBOL}(size_t);\n  \
-            {HOOK_SYMBOL}(size);\n  \
-            struct moonbit_object *ptr = (struct moonbit_object *)libc_malloc(\n        \
-                sizeof(struct moonbit_object) + size);\n  \
-            ptr->rc = 1;\n  \
-            return ptr + 1;\n\
-        }}"
+            "static void *moon_pprof_original_malloc(size_t size);\n\
+             extern void {HOOK_SYMBOL}(size_t);\n\
+             static void *moonbit_malloc_inlined(size_t size) {{\n  \
+             {HOOK_SYMBOL}(size);\n  \
+             return moon_pprof_original_malloc(size);\n\
+             }}\n\
+             static void *moon_pprof_original_malloc(size_t size) {{"
         ),
         HeapProfileMode::Retained => format!(
-            "static void *moonbit_malloc_inlined(size_t size) {{\n  \
-            extern void {ALLOC_PTR_HOOK_SYMBOL}(void *, size_t);\n  \
-            struct moonbit_object *ptr = (struct moonbit_object *)libc_malloc(\n        \
-                sizeof(struct moonbit_object) + size);\n  \
-            ptr->rc = 1;\n  \
-            void *obj = ptr + 1;\n  \
-            {ALLOC_PTR_HOOK_SYMBOL}(obj, size);\n  \
-            return obj;\n\
-        }}"
+            "static void *moon_pprof_original_malloc(size_t size);\n\
+             extern void {ALLOC_PTR_HOOK_SYMBOL}(void *, size_t);\n\
+             static void *moonbit_malloc_inlined(size_t size) {{\n  \
+             void *obj = moon_pprof_original_malloc(size);\n  \
+             {ALLOC_PTR_HOOK_SYMBOL}(obj, size);\n  \
+             return obj;\n\
+             }}\n\
+             static void *moon_pprof_original_malloc(size_t size) {{"
         ),
     };
-
-    let mut out = String::with_capacity(src.len() + replacement.len());
-    out.push_str(&src[..start]);
-    out.push_str(&replacement);
-    out.push_str(&src[end..]);
-
-    if mode == HeapProfileMode::Retained {
+    let out = src.replacen(signature, &wrapper, 1);
+    if matches!(mode, HeapProfileMode::Retained) {
         patch_moonbit_free(&out)
     } else {
         Ok(out)
@@ -722,15 +691,24 @@ fn patch_moonbit_malloc(src: &str, mode: HeapProfileMode) -> Result<String> {
 }
 
 fn patch_moonbit_free(src: &str) -> Result<String> {
-    let needle = "#define moonbit_free(obj) libc_free(Moonbit_object_header(obj))";
-    let replacement = format!(
+    // Expand the original macro inside a helper before redefining it. This
+    // supports both generated-C and runtime-header definitions, keeps allocator
+    // selection intact, and evaluates the caller's argument only once.
+    let insertion = src
+        .find("static void *moonbit_malloc_inlined(size_t size) {")
+        .ok_or_else(|| anyhow!("could not find allocator wrapper for free instrumentation"))?;
+    let wrapper = format!(
         "extern void {FREE_HOOK_SYMBOL}(void *);\n\
-         #define moonbit_free(obj) ({FREE_HOOK_SYMBOL}((void *)(obj)), libc_free(Moonbit_object_header(obj)))"
+         static void moon_pprof_tracked_free(void *obj) {{\n  \
+         {FREE_HOOK_SYMBOL}(obj);\n  \
+         moonbit_free(obj);\n\
+         }}\n\
+         #undef moonbit_free\n\
+         #define moonbit_free(obj) moon_pprof_tracked_free(obj)\n"
     );
-    if !src.contains(needle) {
-        bail!("could not find `moonbit_free` macro in generated C");
-    }
-    Ok(src.replacen(needle, &replacement, 1))
+    let mut out = src.to_owned();
+    out.insert_str(insertion, &wrapper);
+    Ok(out)
 }
 
 // ──────────────────────── raw stream parser ─────────────────────────────
@@ -1156,9 +1134,96 @@ static void *moonbit_malloc_inlined(size_t size) {
         let out = patch_moonbit_malloc(src, HeapProfileMode::Retained).unwrap();
         assert!(out.contains("__moon_pprof_alloc_ptr_hook(obj, size);"));
         assert!(out.contains("extern void __moon_pprof_free_hook(void *);"));
-        assert!(out.contains("__moon_pprof_free_hook((void *)(obj))"));
-        assert!(out.contains("void *obj = ptr + 1;"));
+        assert!(out.contains("__moon_pprof_free_hook(obj);"));
+        assert!(out.contains("ptr->rc = 1;"));
         assert!(out.contains("return obj;"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn allocator_patch_preserves_current_runtime_semantics() {
+        for mode in [HeapProfileMode::Alloc, HeapProfileMode::Retained] {
+            let root = unique_temp_dir("moon-pprof-current-runtime");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("runtime.h"),
+                r#"
+#include <stdlib.h>
+#include <stddef.h>
+struct moonbit_object { unsigned rc; };
+static int collections, allocations, observed_frees, actual_frees;
+#define MOONBIT_TRIAL_DELETION 1
+#define MOONBIT_ALLOCATOR 1
+#define MOONBIT_ALLOCATOR_SYSTEM 1
+#define MOONBIT_MALLOC_RAW malloc
+#define libc_malloc malloc
+#define moonbit_BLOCK_KIND_REGULAR 1
+#define Moonbit_init_dynamic_rc(ptr, kind) ((ptr)->rc = 32 | (kind))
+#define Moonbit_object_header(obj) (((struct moonbit_object *)(obj)) - 1)
+static int moonbit_cycle_collection_threshold(void) { return 1; }
+static void moonbit_collect_cycles(void) { collections++; }
+static void runtime_free(void *ptr) { actual_frees++; free(ptr); }
+#define moonbit_free(obj) runtime_free(Moonbit_object_header(obj))
+void __moon_pprof_alloc_hook(size_t size) { if (size == 12) allocations++; }
+void __moon_pprof_alloc_ptr_hook(void *obj, size_t size) {
+  if (obj && size == 12) allocations++;
+}
+void __moon_pprof_free_hook(void *obj) { if (obj) observed_frees++; }
+"#,
+            )
+            .unwrap();
+            let source = r#"
+#include "runtime.h"
+static void *moonbit_malloc_inlined(size_t size) {
+#if MOONBIT_TRIAL_DELETION && MOONBIT_ALLOCATOR == MOONBIT_ALLOCATOR_SYSTEM
+  // Preserve this safe point and the tagged reference count initialization.
+  if (moonbit_cycle_collection_threshold()) {
+    moonbit_collect_cycles();
+  }
+#endif
+  struct moonbit_object *ptr = (struct moonbit_object *)MOONBIT_MALLOC_RAW(
+      sizeof(struct moonbit_object) + size);
+  Moonbit_init_dynamic_rc(ptr, moonbit_BLOCK_KIND_REGULAR);
+  return ptr + 1;
+}
+"#;
+            let patched = patch_moonbit_malloc(source, mode).unwrap();
+            let expected_frees = if matches!(mode, HeapProfileMode::Retained) {
+                1
+            } else {
+                0
+            };
+            let main = format!(
+                r#"
+int main(void) {{
+  void *objects[1] = {{ moonbit_malloc_inlined(12) }};
+  if (Moonbit_object_header(objects[0])->rc != 33) return 1;
+  if (collections != 1 || allocations != 1) return 2;
+  int index = 0;
+  moonbit_free(objects[index++]);
+  if (index != 1 || actual_frees != 1 || observed_frees != {expected_frees}) return 3;
+  return 0;
+}}
+"#
+            );
+            fs::write(root.join("probe.c"), patched + &main).unwrap();
+            let result = Command::new("cc")
+                .args(["-std=c11", "-Werror", "probe.c", "-o", "probe"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let status = Command::new(root.join("probe")).status().unwrap();
+            fs::remove_dir_all(&root).unwrap();
+            assert!(
+                status.success(),
+                "instrumentation changed runtime semantics: {status}"
+            );
+        }
     }
 
     #[test]
